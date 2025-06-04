@@ -70,6 +70,10 @@ struct Opt {
 	#[clap(short = 'u', long)]
 	nouniq: bool,
 
+	/// Zero out image base addres to show relative offsets
+	#[clap(short = 'z', long)]
+	zero_base: bool,
+
 	/// The path of the file to inspect
 	binary: PathBuf,
 }
@@ -94,7 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 	let b = opts.binary;
 	let b = Binary::new(b)?;
-	let sections = b.sections(opts.raw)?;
+	let sections = b.sections(opts.raw, opts.zero_base)?;
 
 	let noisy = opts.noisy;
 	let colour = opts.colour;

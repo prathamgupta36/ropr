@@ -26,7 +26,7 @@ impl Binary {
 
 	pub fn path(&self) -> &Path { &self.path }
 
-	pub fn sections(&self, raw: Option<bool>) -> Result<Vec<Section>> {
+	pub fn sections(&self, raw: Option<bool>, zero: bool) -> Result<Vec<Section>> {
 		match raw {
 			Some(true) => Ok(vec![Section {
 				file_offset: 0,
@@ -78,7 +78,7 @@ impl Binary {
 							Section {
 								file_offset: start_offset,
 								section_vaddr: section.virtual_address as usize,
-								program_base: p.image_base,
+								program_base: if zero { 0 } else { p.image_base },
 								bytes: &self.bytes[start_offset..end_offset],
 								bitness,
 							}
@@ -133,7 +133,7 @@ impl Binary {
 							Section {
 								file_offset: start_offset,
 								section_vaddr: section.virtual_address as usize,
-								program_base: p.image_base,
+								program_base: if zero { 0 } else { p.image_base },
 								bytes: &self.bytes[start_offset..end_offset],
 								bitness,
 							}
