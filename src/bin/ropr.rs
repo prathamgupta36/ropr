@@ -30,7 +30,7 @@ struct Opt {
 	#[clap(short = 'r', long)]
 	norop: bool,
 
-	/// Removes syscalls and other interrupts
+	/// Removes sysret/iret/sysexit gadgets
 	#[clap(short = 's', long)]
 	nosys: bool,
 
@@ -45,6 +45,18 @@ struct Opt {
 	/// Filters for gadgets which alter the base pointer
 	#[clap(short = 'b', long)]
 	base_pivot: bool,
+
+	/// Exclude gadgets that begin with a NOP instruction, defaults to true
+	#[clap(long)]
+	trim_nops: Option<bool>,
+
+	/// Apply patches for returnsite thunks based on the .return_sites section, defaults to true
+	#[clap(long)]
+	patch_rets: Option<bool>,
+
+	/// Apply patches to convert retpoline thunks to calls based on the .retpoline_sites section, defaults to true
+	#[clap(long)]
+	patch_retpolines: Option<bool>,
 
 	/// Maximum number of instructions in a gadget
 	#[clap(short, long, default_value = "6")]
@@ -70,25 +82,100 @@ struct Opt {
 	#[clap(short = 'u', long)]
 	nouniq: bool,
 
-	/// Zero out image base addres to show relative offsets
-	#[clap(short = 'z', long)]
-	zero_base: bool,
+	/// Alphabetically sort gadget output
+	#[clap(long)]
+	sort: bool,
 
 	/// The path of the file to inspect
 	binary: PathBuf,
+
+    /// Print addresses of useful symbols, requires symbols present (overrides all other options)
+	#[clap(long)]
+	magic: bool,
 }
 
-fn write_gadgets(mut w: impl Write, gadgets: &[(Gadget, usize)]) {
+fn write_gadgets(
+    mut w: impl Write,
+    gadgets: &[(Gadget, usize)],
+    ret_thunk: Option<u64>,
+    thunks: &Vec<(String, Option<u64>)>,
+    sort: bool
+) {
 	let mut output = ColourFormatter::new();
+    let mut formatted_gadgets: Vec<(usize, String)> = vec![];
 	for (gadget, address) in gadgets {
 		output.clear();
-		output.write(&format!("{:#010x}: ", address), FormatterTextKind::Function);
-		gadget.format_instruction(&mut output);
-		match writeln!(w, "{}", output) {
-			Ok(_) => (),
-			Err(_) => return, // Pipe closed - finished writing gadgets
-		}
+
+        let mut formatted = String::new();
+		gadget.format_instruction(&mut formatted);
+
+        if let Some(ret_thunk) = ret_thunk {
+            formatted = formatted.replace(
+                &format!("{ret_thunk:#x};"),
+                &format!("{ret_thunk:#x} <__x86_return_thunk>;")
+            );
+        }
+
+        // replace address of thunks/jump_thunks/call_thunks with the String in the vec
+        let replace_thunk_addresses = |thunks: &Vec<(String, Option<u64>)>, formatted: &mut String| {
+            for (name, address) in thunks {
+                if let Some(addr) = address {
+                    *formatted = formatted.replace(
+                        &format!("{addr:#x}"),
+                        &format!("{addr:#x} <{name}>")
+                    );
+                }
+            }
+        };
+
+        // Replace addresses of thunks with their names
+        replace_thunk_addresses(thunks, &mut formatted);
+
+        if !sort {
+            output.write(&format!("{:#010x}: ", address), FormatterTextKind::Function);
+            output.write(&formatted, FormatterTextKind::Text);
+            match writeln!(w, "{}", output) {
+                Ok(_) => (),
+                Err(_) => return, // Pipe closed - finished writing gadgets
+            }
+        } else {
+            formatted_gadgets.push((address.clone(), formatted));
+        }
 	}
+
+    if sort {
+        formatted_gadgets.sort_by(|(_, gadget1), (_, gadget2)| gadget1.cmp(gadget2));
+        for (address, formatted) in formatted_gadgets {
+            output.clear();
+            output.write(&format!("{:#010x}: ", address), FormatterTextKind::Function);
+            output.write(&formatted, FormatterTextKind::Text);
+            match writeln!(w, "{}", output) {
+                Ok(_) => (),
+                Err(_) => return, // Pipe closed - finished writing gadgets
+            }
+        }
+    }
+}
+
+fn print_magic(bin: &Binary) {
+    let base = bin.get_sym_addr("_text").unwrap_or(0);
+
+    let syms = [
+        "modprobe_path",
+        "core_pattern",
+        "init_cred",
+        "prepare_kernel_cred",
+        "commit_creds",
+        "find_task_by_vpid",
+        "init_nsproxy",
+        "switch_task_namespaces",
+    ];
+
+    for sym in syms {
+        if let Some(addr) = bin.get_sym_addr(sym) {
+            println!("#define {:<24} {:#x}", sym.to_uppercase(), addr-base);
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -97,8 +184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let opts = Opt::parse();
 
 	let b = opts.binary;
-	let b = Binary::new(b)?;
-	let sections = b.sections(opts.raw, opts.zero_base)?;
+	let mut b = Binary::new(b)?;
 
 	let noisy = opts.noisy;
 	let colour = opts.colour;
@@ -106,9 +192,32 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let sys = !opts.nosys;
 	let jop = !opts.nojop;
 	let uniq = !opts.nouniq;
+	let sort = opts.sort;
+	let magic = opts.magic;
+	let trim_nops = opts.trim_nops.unwrap_or(true);
+	let patch_rets = opts.patch_rets;
+	let patch_retpolines = opts.patch_retpolines;
 	let stack_pivot = opts.stack_pivot;
 	let base_pivot = opts.base_pivot;
 	let max_instructions_per_gadget = opts.max_instr as usize;
+
+    if magic {
+        print_magic(&b);
+        return Ok(());
+    }
+
+    if patch_rets.unwrap_or(true) {
+        b.apply_returnsites()?;
+    }
+
+    if patch_retpolines.unwrap_or(true) {
+        match b.get_sym_addr("__x86_indirect_thunk_array") {
+            Some(addr) => b.patch_retpolines(addr)?,
+            None => eprintln!("could not find __x86_indirect_thunk_array symbol, skipping retpoline patching!")
+        }
+    }
+
+	let sections = b.sections(opts.raw)?;
 
 	if max_instructions_per_gadget == 0 {
 		panic!("Max instructions must be >0");
@@ -143,13 +252,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.map(|r| Regex::new(&r))
 		.collect::<Result<Vec<_>, _>>()?;
 
+    // arch/x86/include/asm/GEN-for-each-reg.h
+    let regs = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+
+    // these are indirect jumps but they don't use the return thunk
+    let thunks: Vec<(String, Option<u64>)> = regs.into_iter()
+        .map(|r| (format!("__x86_indirect_thunk_{r}"), b.get_sym_addr(&format!("__x86_indirect_thunk_{r}"))))
+        .collect();
+
+    let ret_thunk = b.get_sym_addr("__x86_return_thunk");
+
 	let gadget_to_addr = sections
 		.iter()
 		.filter_map(Disassembly::new)
 		.flat_map(|dis| {
 			(0..dis.bytes().len())
 				.into_par_iter()
-				.filter(|offset| dis.is_tail_at(*offset, rop, sys, jop, noisy))
+				.filter(|offset| dis.is_tail_at(*offset, rop, sys, jop, noisy, ret_thunk, &thunks))
 				.flat_map_iter(|tail| {
 					dis.gadgets_from_tail(tail, max_instructions_per_gadget, noisy, uniq)
 				})
@@ -173,8 +292,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 			regices.iter().all(|r| r.is_match(&formatted))
 				&& !regices_inverse.iter().any(|r| r.is_match(&formatted))
 		})
-		.filter(|(g, _)| !stack_pivot | g.is_stack_pivot())
+		.filter(|(g, _)| !stack_pivot | g.is_stack_pivot(ret_thunk))
 		.filter(|(g, _)| !base_pivot | g.is_base_pivot())
+		.filter(|(g, _)| !trim_nops | !matches!(g.instructions()[0].mnemonic(), iced_x86::Mnemonic::Nop))
 		.collect::<Vec<_>>();
 	gadgets.sort_unstable_by(|(_, addr1), (_, addr2)| addr1.cmp(addr2));
 
@@ -190,7 +310,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		set_override(colour);
 	}
 
-	write_gadgets(&mut stdout, &gadgets);
+	write_gadgets(&mut stdout, &gadgets, ret_thunk, &thunks, sort);
 
 	stdout.into_inner()?.flush()?;
 

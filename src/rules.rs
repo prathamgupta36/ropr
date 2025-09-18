@@ -1,11 +1,60 @@
 use iced_x86::{Code, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
-fn is_ret(instr: &Instruction) -> bool { matches!(instr.mnemonic(), Mnemonic::Ret) }
+fn is_ret(instr: &Instruction, ret_thunk: Option<u64>) -> bool {
+    match instr.mnemonic() {
+        Mnemonic::Ret => true,
+        Mnemonic::Jmp => {
+            let ret_thunk = match ret_thunk {
+                Some(ret_thunk) => ret_thunk,
+                None => { return false; }
+            };
+            match instr.op0_kind() {
+                OpKind::NearBranch64 |OpKind::NearBranch32 | OpKind::NearBranch16 => {
+                    instr.near_branch_target() == ret_thunk
+                },
+                _ => false
+            }
+        }
+        _ => false
+    }
+}
+
+fn is_target_thunk(
+    instr: &Instruction,
+    ret_thunk: Option<u64>,
+	thunks: &Vec<(String, Option<u64>)>,
+) -> bool {
+    match instr.mnemonic() {
+        Mnemonic::Jmp => {
+            match instr.op0_kind() {
+                OpKind::NearBranch64 |OpKind::NearBranch32 | OpKind::NearBranch16 => {
+                    let target = instr.near_branch_target();
+
+                    // check return_thunk first
+                    if ret_thunk == Some(target) {
+                        return true;
+                    }
+
+                    // then check each vector of thunks
+                    for (_, thunk_addr) in thunks.iter() {
+                        if let Some(addr) = thunk_addr {
+                            if *addr == target {
+                                return true;
+                            }
+                        }
+                    }
+
+                    false
+                },
+                _ => false
+            }
+        },
+        _ => false
+    }
+}
 
 fn is_sys(instr: &Instruction) -> bool {
 	match instr.mnemonic() {
-		Mnemonic::Syscall => true,
-		Mnemonic::Int => matches!(instr.try_immediate(0).unwrap(), 0x80),
 		Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq => true,
 		Mnemonic::Sysret | Mnemonic::Sysretq | Mnemonic::Sysexit | Mnemonic::Sysexitq => true,
 		_ => false,
@@ -16,10 +65,7 @@ fn is_jop(instr: &Instruction, noisy: bool) -> bool {
 	match instr.mnemonic() {
 		Mnemonic::Jmp => {
 			if noisy {
-				!matches!(
-					instr.op0_kind(),
-					OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16
-				)
+				true
 			}
 			else {
 				match instr.op0_kind() {
@@ -31,10 +77,7 @@ fn is_jop(instr: &Instruction, noisy: bool) -> bool {
 		}
 		Mnemonic::Call => {
 			if noisy {
-				!matches!(
-					instr.op0_kind(),
-					OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16
-				)
+				true
 			}
 			else {
 				match instr.op0_kind() {
@@ -50,14 +93,25 @@ fn is_jop(instr: &Instruction, noisy: bool) -> bool {
 
 fn is_invalid(instr: &Instruction) -> bool { matches!(instr.code(), Code::INVALID) }
 
-pub fn is_gadget_tail(instr: &Instruction, rop: bool, sys: bool, jop: bool, noisy: bool) -> bool {
+pub fn is_gadget_tail(
+    instr: &Instruction,
+    rop: bool,
+    sys: bool,
+    jop: bool,
+    noisy: bool,
+    ret_thunk: Option<u64>,
+    thunks: &Vec<(String, Option<u64>)>,
+) -> bool {
 	if is_invalid(instr) {
 		return false;
 	}
 	if instr.flow_control() == FlowControl::Next {
 		return false;
 	}
-	if rop && is_ret(instr) {
+    if rop && is_target_thunk(instr, ret_thunk, thunks) {
+        return true;
+    }
+	if rop && is_ret(instr, ret_thunk) {
 		return true;
 	}
 	if sys && is_sys(instr) {
@@ -84,7 +138,7 @@ pub fn is_rop_gadget_head(instr: &Instruction, noisy: bool) -> bool {
 		return false;
 	}
 	match instr.flow_control() {
-		FlowControl::Next | FlowControl::Interrupt => true,
+		FlowControl::Next => true,
 		FlowControl::ConditionalBranch => noisy,
 		FlowControl::Call => instr.mnemonic() != Mnemonic::Call,
 		_ => false,
@@ -148,7 +202,7 @@ pub fn is_stack_pivot_head(instr: &Instruction) -> bool {
 	}
 }
 
-pub fn is_stack_pivot_tail(instr: &Instruction) -> bool { is_ret(instr) }
+pub fn is_stack_pivot_tail(instr: &Instruction, ret_thunk: Option<u64>) -> bool { is_ret(instr, ret_thunk) }
 
 pub fn is_base_pivot_head(instr: &Instruction) -> bool {
 	let reg0 = instr.op0_register();
